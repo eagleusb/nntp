@@ -1,18 +1,12 @@
-// Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
-// The nntp package implements a client for the news protocol NNTP,
+// Package nntp implements a client for the news protocol NNTP,
 // as defined in RFC 3977.
 package nntp
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"sort"
@@ -27,6 +21,10 @@ const timeFormatNew = "20060102 150405"
 // timeFormatDate is the NNTP time format string for responses to the DATE command
 const timeFormatDate = "20060102150405"
 
+var dotnl  = []byte(".\n")
+var dotdot = []byte("..")
+var colon  = []byte{':'}
+
 // An Error represents an error response from an NNTP server.
 type Error struct {
 	Code uint
@@ -36,6 +34,14 @@ type Error struct {
 // A ProtocolError represents responses from an NNTP server
 // that seem incorrect for NNTP.
 type ProtocolError string
+
+func (p ProtocolError) Error() string {
+	return string(p)
+}
+
+func (e Error) Error() string {
+	return fmt.Sprintf("%03d %s", e.Code, e.Msg)
+}
 
 // A Conn represents a connection to an NNTP server. The connection with
 // an NNTP server is stateful; it keeps track of what group you have
@@ -57,136 +63,24 @@ type Conn struct {
 	close bool
 }
 
-// A Group gives information about a single news group on the server.
-type Group struct {
-	Name string
-	// High and low message-numbers
-	High, Low int
-	// Status indicates if general posting is allowed --
-	// typical values are "y", "n", or "m".
-	Status string
-}
-
-// An Article represents an NNTP article.
-type Article struct {
-	Header map[string][]string
-	Body   io.Reader
-}
-
-// A bodyReader satisfies reads by reading from the connection
-// until it finds a line containing just .
-type bodyReader struct {
-	c   *Conn
-	eof bool
-	buf *bytes.Buffer
-}
-
-var dotnl = []byte(".\n")
-var dotdot = []byte("..")
-
-func (r *bodyReader) Read(p []byte) (n int, err error) {
-	if r.eof {
-		return 0, io.EOF
+// Dial connects to an NNTP server.
+// The network and addr are passed to net.Dial to
+// make the connection.
+func Dial(network, addr string) (*Conn, error) {
+	c, err := net.Dial(network, addr)
+	if checkErr(err) {
+		return nil, err
 	}
-	if r.buf == nil {
-		r.buf = &bytes.Buffer{}
+	return newConn(c)
+}
+
+// DialTLS connect to an NNTP server with TLS
+func DialTLS(network, addr string, config *tls.Config) (*Conn, error) {
+	c, err := tls.Dial(network, addr, config)
+	if checkErr(err) {
+		return nil, err
 	}
-	if r.buf.Len() == 0 {
-		b, err := r.c.r.ReadBytes('\n')
-		if err != nil {
-			return 0, err
-		}
-		// canonicalize newlines
-		if b[len(b)-2] == '\r' { // crlf->lf
-			b = b[0 : len(b)-1]
-			b[len(b)-1] = '\n'
-		}
-		// stop on .
-		if bytes.Equal(b, dotnl) {
-			r.eof = true
-			return 0, io.EOF
-		}
-		// unescape leading ..
-		if bytes.HasPrefix(b, dotdot) {
-			b = b[1:]
-		}
-		r.buf.Write(b)
-	}
-	n, _ = r.buf.Read(p)
-	return
-}
-
-func (r *bodyReader) discard() error {
-	_, err := ioutil.ReadAll(r)
-	return err
-}
-
-// articleReader satisfies reads by dumping out an article's headers
-// and body.
-type articleReader struct {
-	a          *Article
-	headerdone bool
-	headerbuf  *bytes.Buffer
-}
-
-func (r *articleReader) Read(p []byte) (n int, err error) {
-	if r.headerbuf == nil {
-		buf := new(bytes.Buffer)
-		for k, fv := range r.a.Header {
-			for _, v := range fv {
-				fmt.Fprintf(buf, "%s: %s\n", k, v)
-			}
-		}
-		if r.a.Body != nil {
-			fmt.Fprintf(buf, "\n")
-		}
-		r.headerbuf = buf
-	}
-	if !r.headerdone {
-		n, err = r.headerbuf.Read(p)
-		if err == io.EOF {
-			err = nil
-			r.headerdone = true
-		}
-		if n > 0 {
-			return
-		}
-	}
-	if r.a.Body != nil {
-		n, err = r.a.Body.Read(p)
-		if err == io.EOF {
-			r.a.Body = nil
-		}
-		return
-	}
-	return 0, io.EOF
-}
-
-func (a *Article) String() string {
-	id, ok := a.Header["Message-Id"]
-	if !ok {
-		return "[NNTP article]"
-	}
-	return fmt.Sprintf("[NNTP article %s]", id[0])
-}
-
-func (a *Article) WriteTo(w io.Writer) (int64, error) {
-	return io.Copy(w, &articleReader{a: a})
-}
-
-func (p ProtocolError) Error() string {
-	return string(p)
-}
-
-func (e Error) Error() string {
-	return fmt.Sprintf("%03d %s", e.Code, e.Msg)
-}
-
-func maybeId(cmd, id string) string {
-	if len(id) > 0 {
-		return cmd + " " + id
-	}
-	return cmd
+	return newConn(c)
 }
 
 func newConn(c net.Conn) (res *Conn, err error) {
@@ -194,38 +88,10 @@ func newConn(c net.Conn) (res *Conn, err error) {
 		conn: c,
 		r:    bufio.NewReaderSize(c, 4096),
 	}
-
 	if _, err = res.r.ReadString('\n'); err != nil {
 		return
 	}
-
 	return
-}
-
-// Dial connects to an NNTP server.
-// The network and addr are passed to net.Dial to
-// make the connection.
-//
-// Example:
-//   conn, err := nntp.Dial("tcp", "my.news:nntp")
-//
-func Dial(network, addr string) (*Conn, error) {
-	c, err := net.Dial(network, addr)
-	if err != nil {
-		return nil, err
-	}
-	return newConn(c)
-}
-
-// Same as Dial but handles TLS connections
-func DialTLS(network, addr string, config *tls.Config) (*Conn, error) {
-	// dial
-	c, err := tls.Dial(network, addr, config)
-	if err != nil {
-		return nil, err
-	}
-	// return nntp Conn
-	return newConn(c)
 }
 
 func (c *Conn) body() io.Reader {
@@ -240,7 +106,7 @@ func (c *Conn) readStrings() ([]string, error) {
 	var sv []string
 	for {
 		line, err := c.r.ReadString('\n')
-		if err != nil {
+		if checkErr(err) {
 			return nil, err
 		}
 		if strings.HasSuffix(line, "\r\n") {
@@ -354,7 +220,7 @@ func (c *Conn) NewNews(group string, since time.Time) ([]string, error) {
 	return id, nil
 }
 
-// Overview of a message returned by OVER command.
+// MessageOverview returned by OVER command.
 type MessageOverview struct {
 	MessageNumber int       // Message number in the group
 	Subject       string    // Subject header value. Empty if the header is missing.
@@ -411,27 +277,6 @@ func (c *Conn) Overview(begin, end int) ([]MessageOverview, error) {
 		result = append(result, overview)
 	}
 	return result, nil
-}
-
-// parseGroups is used to parse a list of group states.
-func parseGroups(lines []string) ([]*Group, error) {
-	res := make([]*Group, 0)
-	for _, line := range lines {
-		ss := strings.SplitN(strings.TrimSpace(line), " ", 4)
-		if len(ss) < 4 {
-			return nil, ProtocolError("short group info line: " + line)
-		}
-		high, err := strconv.Atoi(ss[1])
-		if err != nil {
-			return nil, ProtocolError("bad number in line: " + line)
-		}
-		low, err := strconv.Atoi(ss[2])
-		if err != nil {
-			return nil, ProtocolError("bad number in line: " + line)
-		}
-		res = append(res, &Group{ss[0], high, low, ss[3]})
-	}
-	return res, nil
 }
 
 // Capabilities returns a list of features this server performs.
@@ -645,104 +490,6 @@ func (c *Conn) Quit() error {
 	c.conn.Close()
 	c.close = true
 	return err
-}
-
-// Functions after this point are mostly copy-pasted from http
-// (though with some modifications). They should be factored out to
-// a common library.
-
-// Read a line of bytes (up to \n) from b.
-// Give up if the line exceeds maxLineLength.
-// The returned bytes are a pointer into storage in
-// the bufio, so they are only valid until the next bufio read.
-func readLineBytes(b *bufio.Reader) (p []byte, err error) {
-	if p, err = b.ReadSlice('\n'); err != nil {
-		// We always know when EOF is coming.
-		// If the caller asked for a line, there should be a line.
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		return nil, err
-	}
-
-	// Chop off trailing white space.
-	var i int
-	for i = len(p); i > 0; i-- {
-		if c := p[i-1]; c != ' ' && c != '\r' && c != '\t' && c != '\n' {
-			break
-		}
-	}
-	return p[0:i], nil
-}
-
-var colon = []byte{':'}
-
-// Read a key/value pair from b.
-// A key/value has the form Key: Value\r\n
-// and the Value can continue on multiple lines if each continuation line
-// starts with a space/tab.
-func readKeyValue(b *bufio.Reader) (key, value string, err error) {
-	line, e := readLineBytes(b)
-	if e == io.ErrUnexpectedEOF {
-		return "", "", nil
-	} else if e != nil {
-		return "", "", e
-	}
-	if len(line) == 0 {
-		return "", "", nil
-	}
-
-	// Scan first line for colon.
-	i := bytes.Index(line, colon)
-	if i < 0 {
-		goto Malformed
-	}
-
-	key = string(line[0:i])
-	if strings.Index(key, " ") >= 0 {
-		// Key field has space - no good.
-		goto Malformed
-	}
-
-	// Skip initial space before value.
-	for i++; i < len(line); i++ {
-		if line[i] != ' ' && line[i] != '\t' {
-			break
-		}
-	}
-	value = string(line[i:])
-
-	// Look for extension lines, which must begin with space.
-	for {
-		c, e := b.ReadByte()
-		if c != ' ' && c != '\t' {
-			if e != io.EOF {
-				b.UnreadByte()
-			}
-			break
-		}
-
-		// Eat leading space.
-		for c == ' ' || c == '\t' {
-			if c, e = b.ReadByte(); e != nil {
-				if e == io.EOF {
-					e = io.ErrUnexpectedEOF
-				}
-				return "", "", e
-			}
-		}
-		b.UnreadByte()
-
-		// Read the rest of the line and add to value.
-		if line, e = readLineBytes(b); e != nil {
-			return "", "", e
-		}
-		value += " " + string(line)
-	}
-	return key, value, nil
-
-Malformed:
-	return "", "", ProtocolError("malformed header line: " + string(line))
 }
 
 // Internal. Parses headers in NNTP articles. Most of this is stolen from the http package,
